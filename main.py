@@ -1,17 +1,21 @@
 """
 DTC Brand Scraper — Apify Actor
 ================================
-Scrapes Meta Ad Library directly via Playwright (no paid sub-actors).
-Classifies brands by vertical using keyword matching.
+Scrapes Meta Ad Library via Playwright + GraphQL interception.
+Primary: captures XHR/GraphQL API responses (structured JSON).
+Fallback: HTML extraction of CTA links from ad cards.
 
-Input (via Apify UI or API):
-    searchTerms      list[str]   Keywords to search
-    country          str         Country code (default: US)
-    adsLimitPerTerm  int         Ads to scroll per term (default: 200)
-    maxBrands        int         Max unique brands to output (default: 500)
+Input (Apify UI):
+    searchTerms      list[str]
+    filterKeywords   list[str]   (optional, filters results)
+    targetVerticals  list[str]   (optional, filters results)
+    country          str
+    adsLimitPerTerm  int
+    maxBrands        int
 """
 
 import asyncio
+import json
 import logging
 import re
 from urllib.parse import urlparse, urlencode
@@ -24,16 +28,12 @@ from classifier import classify, confidence_label
 log = logging.getLogger(__name__)
 
 AD_LIBRARY_BASE = "https://www.facebook.com/ads/library/"
-
-# How long to wait for ads to load after scroll (ms)
-SCROLL_WAIT_MS = 2000
-
-# Pixels to scroll per step
-SCROLL_STEP_PX = 1500
+SCROLL_STEP_PX  = 1200
+SCROLL_WAIT_MS  = 2500
 
 
 # ─────────────────────────────────────────
-#  FACEBOOK AD LIBRARY SCRAPER
+#  HELPERS
 # ─────────────────────────────────────────
 
 def build_search_url(term: str, country: str) -> str:
@@ -48,108 +48,157 @@ def build_search_url(term: str, country: str) -> str:
     return f"{AD_LIBRARY_BASE}?{urlencode(params)}"
 
 
-async def dismiss_overlays(page: Page) -> None:
-    """Close cookie banners and login prompts if they appear."""
-    overlay_selectors = [
-        '[data-testid="cookie-policy-manage-dialog"] button',
-        'div[role="dialog"] [aria-label="Close"]',
-        '[aria-label="Close"]',
-        'button[title="Close"]',
-    ]
-    for sel in overlay_selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                await page.wait_for_timeout(500)
-        except Exception:
-            pass
+def extract_domain(url: str) -> str | None:
+    """Return clean domain from URL, or None if invalid/Facebook."""
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        host = urlparse(url).netloc.lower().replace("www.", "")
+        skip = {"facebook.com", "fb.com", "fb.watch", "instagram.com",
+                "l.facebook.com", "m.facebook.com", ""}
+        return host if host not in skip and "." in host else None
+    except Exception:
+        return None
 
 
-async def extract_ads_from_page(page: Page) -> list[dict]:
+# ─────────────────────────────────────────
+#  GRAPHQL RESPONSE PARSER
+# ─────────────────────────────────────────
+
+def _find_ads_recursive(node: object, results: list) -> None:
     """
-    Extract ad data from currently rendered Ad Library page.
+    Walk any JSON structure and collect objects that look like ad entries.
+    Facebook's GraphQL response nests ad data deeply — we don't rely on
+    a fixed schema, just look for objects containing page_name + a URL.
+    """
+    if isinstance(node, dict):
+        page_name = node.get("page_name") or node.get("advertiser_name") or ""
+        snapshot  = node.get("snapshot") or {}
 
-    Strategy: intercept all <a> tags that point to external domains
-    (these are the CTA links like "Shop Now", "Learn More") and
-    pair them with the nearest advertiser name in the card.
+        # Candidate CTA URLs in order of preference
+        link_url = (
+            (snapshot.get("link_url") if isinstance(snapshot, dict) else None)
+            or (snapshot.get("website_url") if isinstance(snapshot, dict) else None)
+            or node.get("link_url")
+            or node.get("website_url")
+            or ""
+        )
+
+        # Ad body text
+        body = ""
+        if isinstance(snapshot, dict):
+            body_node = snapshot.get("body") or {}
+            body = (
+                (body_node.get("markup") if isinstance(body_node, dict) else body_node)
+                or snapshot.get("title")
+                or snapshot.get("caption")
+                or ""
+            )
+
+        domain = extract_domain(str(link_url))
+        if page_name and domain:
+            results.append({
+                "domain":     domain,
+                "website":    f"https://{domain}",
+                "advertiser": str(page_name)[:80],
+                "ad_text":    str(body)[:200],
+                "cta_url":    str(link_url),
+                "source":     "graphql",
+            })
+
+        for v in node.values():
+            _find_ads_recursive(v, results)
+
+    elif isinstance(node, list):
+        for item in node:
+            _find_ads_recursive(item, results)
+
+
+def parse_graphql_response(text: str) -> list[dict]:
+    """Parse a raw GraphQL response body and extract ad entries."""
+    results: list[dict] = []
+    try:
+        # Facebook sometimes returns multiple JSON objects on separate lines
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                _find_ads_recursive(data, results)
+            except json.JSONDecodeError:
+                pass
+    except Exception as e:
+        log.debug(f"GraphQL parse error: {e}")
+    return results
+
+
+# ─────────────────────────────────────────
+#  HTML FALLBACK EXTRACTOR
+# ─────────────────────────────────────────
+
+async def extract_ads_html_fallback(page: Page) -> list[dict]:
+    """
+    Fallback: find CTA links (target=_blank to external domains) on the page.
+    Only used if GraphQL interception yielded nothing.
     """
     ads = await page.evaluate("""
         () => {
             const results = [];
             const seen    = new Set();
 
-            // Ad cards: Facebook wraps each ad in a div with role or
-            // a predictable structure. We target the CTA links with
-            // external URLs as anchors, then walk up to the card.
-            const allLinks = Array.from(document.querySelectorAll('a[href]'));
+            // Target links that open in new tab (CTA buttons) to external domains
+            const links = Array.from(document.querySelectorAll('a[href][target="_blank"], a[href][rel*="noopener"]'));
 
-            for (const link of allLinks) {
+            for (const link of links) {
                 const href = link.href || '';
-
-                // Only external links (skip facebook.com internal)
                 if (!href.startsWith('http')) continue;
-                try {
-                    const url = new URL(href);
-                    if (url.hostname.includes('facebook.com')) continue;
-                    if (url.hostname.includes('instagram.com')) continue;
-                    if (url.hostname.includes('fb.com')) continue;
-                    if (url.hostname.includes('fb.watch')) continue;
 
+                try {
+                    const url    = new URL(href);
                     const domain = url.hostname.replace(/^www\\./, '');
+                    const skip   = ['facebook.com','fb.com','instagram.com','fb.watch','metastatus.com'];
+
                     if (!domain || seen.has(domain)) continue;
+                    if (skip.some(s => domain.includes(s))) continue;
+                    if (!domain.includes('.')) continue;
+
                     seen.add(domain);
 
-                    // Walk up to find the ad card container (max 12 levels)
+                    // Walk up max 15 levels to find the ad card
                     let card = link;
-                    for (let i = 0; i < 12; i++) {
+                    for (let i = 0; i < 15; i++) {
+                        if (!card.parentElement) break;
                         card = card.parentElement;
-                        if (!card) break;
+                        // Stop at a "large enough" container
+                        if (card.innerText && card.innerText.length > 100) break;
                     }
 
-                    // Extract advertiser name: look for a link to a FB page
-                    // (they contain /ads/library/?active_status or just a page URL)
+                    // Advertiser: look for FB page links within the card
                     let advertiser = '';
-                    if (card) {
-                        const pageLinks = card.querySelectorAll('a[href*="facebook.com"]');
-                        for (const pl of pageLinks) {
-                            const text = pl.innerText.trim();
-                            if (text.length > 0 && text.length < 80) {
-                                advertiser = text;
-                                break;
-                            }
-                        }
-
-                        // Fallback: any heading-like element
-                        if (!advertiser) {
-                            const heading = card.querySelector('h2, h3, strong, b');
-                            if (heading) advertiser = heading.innerText.trim().slice(0, 80);
-                        }
+                    const fbLinks = card.querySelectorAll('a[href*="facebook.com/"]');
+                    for (const fl of fbLinks) {
+                        const t = (fl.innerText || '').trim();
+                        if (t.length > 1 && t.length < 80) { advertiser = t; break; }
                     }
 
-                    // Ad body text: grab visible text around the CTA link
+                    // Ad text: first substantial text block
                     let adText = '';
-                    if (card) {
-                        const paragraphs = card.querySelectorAll('p, span, div');
-                        for (const p of paragraphs) {
-                            const t = p.innerText.trim();
-                            if (t.length > 20 && t.length < 300) {
-                                adText = t;
-                                break;
-                            }
-                        }
+                    const texts = card.querySelectorAll('span, p');
+                    for (const el of texts) {
+                        const t = (el.innerText || '').trim();
+                        if (t.length > 30 && t.length < 300) { adText = t; break; }
                     }
 
                     results.push({
                         domain:     domain,
-                        website:    `https://${domain}`,
+                        website:    'https://' + domain,
                         advertiser: advertiser || 'Unknown',
                         ad_text:    adText.slice(0, 200),
                         cta_url:    href,
+                        source:     'html_fallback',
                     });
-                } catch (e) {
-                    continue;
-                }
+                } catch (e) { continue; }
             }
             return results;
         }
@@ -157,45 +206,116 @@ async def extract_ads_from_page(page: Page) -> list[dict]:
     return ads or []
 
 
+# ─────────────────────────────────────────
+#  OVERLAY DISMISSAL
+# ─────────────────────────────────────────
+
+async def dismiss_overlays(page: Page) -> None:
+    """Dismiss cookie banners, login prompts, and other overlays."""
+    selectors = [
+        '[data-testid="cookie-policy-manage-dialog"] button',
+        'div[role="dialog"] [aria-label="Close"]',
+        '[aria-label="Close"]',
+        'button[title="Close"]',
+        '[data-cookiebanner] button',
+        # Facebook "Continue without logging in" or similar
+        'div[role="dialog"] button:last-child',
+    ]
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1000):
+                await btn.click()
+                await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────
+#  CORE SCRAPER
+# ─────────────────────────────────────────
+
 async def scrape_search_term(
     context: BrowserContext,
     term: str,
     country: str,
     limit: int,
 ) -> list[dict]:
-    """Scrape one search term, scrolling until limit reached or no new ads."""
     url  = build_search_url(term, country)
     page = await context.new_page()
 
-    log.info(f"Navigating: {url}")
+    # Collect all GraphQL responses for this page
+    graphql_ads: list[dict] = []
+
+    async def on_response(response):
+        if "api/graphql" not in response.url and "graphql" not in response.url:
+            return
+        try:
+            text = await response.text()
+            # Quick check before full parse
+            if "page_name" not in text and "advertiser_name" not in text:
+                return
+            found = parse_graphql_response(text)
+            if found:
+                log.debug(f"  GraphQL batch: +{len(found)} ads")
+                graphql_ads.extend(found)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    log.info(f"Loading: {url}")
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # Give React time to boot and fire initial XHR
+        await page.wait_for_timeout(4000)
         await dismiss_overlays(page)
         await page.wait_for_timeout(1000)
     except Exception as e:
-        log.error(f"Failed to load page for '{term}': {e}")
+        log.error(f"Navigation failed for '{term}': {e}")
         await page.close()
         return []
+
+    # Log page title so we know what loaded
+    title = await page.title()
+    log.info(f"  Page title: '{title}'")
 
     collected: dict[str, dict] = {}
     no_new_streak = 0
 
-    while len(collected) < limit:
-        # Extract ads from current view
-        batch = await extract_ads_from_page(page)
-        new_count = 0
-        for ad in batch:
+    # Scroll loop
+    for scroll_num in range(150):  # hard cap
+        if len(collected) >= limit:
+            break
+
+        # Merge latest GraphQL results
+        before = len(collected)
+        for ad in graphql_ads:
             if ad["domain"] not in collected:
                 collected[ad["domain"]] = ad
-                new_count += 1
+        graphql_ads.clear()
 
-        log.info(f"  '{term}': {len(collected)} unique brands (batch +{new_count})")
+        new_from_graphql = len(collected) - before
 
-        if new_count == 0:
+        # If GraphQL gave nothing, try HTML fallback
+        new_from_html = 0
+        if new_from_graphql == 0:
+            html_ads = await extract_ads_html_fallback(page)
+            for ad in html_ads:
+                if ad["domain"] not in collected:
+                    collected[ad["domain"]] = ad
+                    new_from_html += 1
+
+        total_new = new_from_graphql + new_from_html
+        log.info(
+            f"  Scroll {scroll_num+1} | '{term}' | "
+            f"total={len(collected)} (+gql={new_from_graphql} +html={new_from_html})"
+        )
+
+        if total_new == 0:
             no_new_streak += 1
-            if no_new_streak >= 3:
-                log.info(f"  No new ads after 3 scrolls, stopping '{term}'")
+            if no_new_streak >= 4:
+                log.info(f"  No new ads for 4 scrolls — stopping '{term}'")
                 break
         else:
             no_new_streak = 0
@@ -204,32 +324,30 @@ async def scrape_search_term(
         await page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})")
         await page.wait_for_timeout(SCROLL_WAIT_MS)
 
-        # Check if we hit the bottom
+        # Check bottom
         at_bottom = await page.evaluate(
-            "(window.innerHeight + window.scrollY) >= document.body.scrollHeight - 200"
+            "(window.innerHeight + window.scrollY) >= document.body.scrollHeight - 300"
         )
-        if at_bottom:
-            log.info(f"  Reached page bottom for '{term}'")
+        if at_bottom and scroll_num > 2:
+            log.info(f"  Reached bottom for '{term}'")
             break
 
     await page.close()
-    log.info(f"Finished '{term}': {len(collected)} brands")
+    log.info(f"Done '{term}': {len(collected)} unique brands")
     return list(collected.values())
 
 
 # ─────────────────────────────────────────
-#  CLASSIFICATION
+#  CLASSIFICATION + FILTERS
 # ─────────────────────────────────────────
 
-def classify_brands(brands: list[dict]) -> list[dict]:
-    """Classify each brand using keyword matching on domain + ad text."""
+def classify_brands(brands: list[dict]) -> None:
     for brand in brands:
         text            = f"{brand['domain']} {brand['ad_text']}"
         vertical, score = classify(text)
-        brand["vertical"]    = vertical
-        brand["confidence"]  = confidence_label(score)
-        brand["kw_score"]    = score
-    return brands
+        brand["vertical"]   = vertical
+        brand["confidence"] = confidence_label(score)
+        brand["kw_score"]   = score
 
 
 def apply_filters(
@@ -237,30 +355,20 @@ def apply_filters(
     filter_keywords: list[str],
     target_verticals: list[str],
 ) -> list[dict]:
-    """
-    Apply research filters to classified brands.
-
-    filter_keywords  — keep only brands whose domain or ad text contains
-                       at least one of these keywords (case-insensitive).
-                       Empty list = keep all.
-
-    target_verticals — keep only brands in these verticals.
-                       Empty list = keep all.
-    """
     result = brands
 
     if filter_keywords:
-        kws = [kw.lower() for kw in filter_keywords]
+        kws    = [kw.lower() for kw in filter_keywords]
         result = [
             b for b in result
             if any(kw in f"{b['domain']} {b['ad_text']}".lower() for kw in kws)
         ]
-        log.info(f"After filterKeywords ({filter_keywords}): {len(result)} brands")
+        log.info(f"After filterKeywords: {len(result)} brands")
 
     if target_verticals:
-        tvs = [v.lower() for v in target_verticals]
+        tvs    = [v.lower() for v in target_verticals]
         result = [b for b in result if b.get("vertical", "").lower() in tvs]
-        log.info(f"After targetVerticals ({target_verticals}): {len(result)} brands")
+        log.info(f"After targetVerticals: {len(result)} brands")
 
     return result
 
@@ -273,18 +381,17 @@ async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms      = inp.get("searchTerms",     ["shop now free shipping", "buy now limited offer", "try risk free"])
-        filter_keywords   = inp.get("filterKeywords",   [])
-        target_verticals  = inp.get("targetVerticals",  [])
-        country           = inp.get("country",          "US")
-        ads_limit         = inp.get("adsLimitPerTerm",  200)
-        max_brands        = inp.get("maxBrands",        500)
+        search_terms     = inp.get("searchTerms",    ["shop now free shipping", "buy now limited offer"])
+        filter_keywords  = inp.get("filterKeywords",  [])
+        target_verticals = inp.get("targetVerticals", [])
+        country          = inp.get("country",         "US")
+        ads_limit        = inp.get("adsLimitPerTerm", 200)
+        max_brands       = inp.get("maxBrands",       500)
 
         log.info(
-            f"Starting DTC scraper | terms={len(search_terms)} | "
+            f"DTC Scraper | terms={len(search_terms)} | "
             f"limit/term={ads_limit} | country={country} | "
-            f"filterKeywords={filter_keywords or 'all'} | "
-            f"targetVerticals={target_verticals or 'all'}"
+            f"filter={filter_keywords or 'none'} | verticals={target_verticals or 'all'}"
         )
 
         all_brands: dict[str, dict] = {}
@@ -296,6 +403,7 @@ async def main() -> None:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
                 ],
             )
             context = await browser.new_context(
@@ -306,6 +414,9 @@ async def main() -> None:
                 ),
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
 
             for term in search_terms:
@@ -314,27 +425,21 @@ async def main() -> None:
                     if b["domain"] not in all_brands:
                         all_brands[b["domain"]] = b
                 if len(all_brands) >= max_brands:
-                    log.info(f"Reached maxBrands limit ({max_brands}), stopping")
+                    log.info(f"Reached maxBrands cap ({max_brands})")
                     break
 
             await browser.close()
 
-        # Classify
         brand_list = list(all_brands.values())[:max_brands]
         classify_brands(brand_list)
-
-        # Apply research filters
         brand_list = apply_filters(brand_list, filter_keywords, target_verticals)
 
-        log.info(f"Total brands after filtering: {len(brand_list)}")
-
-        # Push to Apify dataset
+        log.info(f"Pushing {len(brand_list)} brands to dataset")
         await Actor.push_data(brand_list)
 
-        # Summary log
         from collections import Counter
-        verticals = Counter(b["vertical"] for b in brand_list)
-        log.info("Vertical breakdown: " + " | ".join(f"{v}:{c}" for v, c in verticals.most_common()))
+        v = Counter(b["vertical"] for b in brand_list)
+        log.info("Verticals: " + " | ".join(f"{k}:{c}" for k, c in v.most_common()))
 
 
 if __name__ == "__main__":
