@@ -27,9 +27,56 @@ logging.basicConfig(
 
 from apify import Actor
 from playwright.async_api import async_playwright, Page, BrowserContext
-from playwright_stealth import stealth_async
 
 from classifier import classify, confidence_label
+
+# Stealth JS injected before every page load
+# Patches the signals Facebook uses to detect headless Chromium
+STEALTH_SCRIPT = """
+() => {
+    // 1. Remove webdriver flag
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // 2. Fake plugins (real Chrome has plugins)
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const arr = [{ name:'Chrome PDF Plugin' }, { name:'Chrome PDF Viewer' }, { name:'Native Client' }];
+            arr.item = i => arr[i];
+            arr.namedItem = n => arr.find(p => p.name === n);
+            arr.refresh = () => {};
+            Object.defineProperty(arr, 'length', { get: () => 3 });
+            return arr;
+        }
+    });
+
+    // 3. Languages
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+    // 4. Chrome runtime object
+    if (!window.chrome) {
+        window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} };
+    }
+
+    // 5. Permissions API (headless fails this check)
+    const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (origQuery) {
+        window.navigator.permissions.query = (params) =>
+            params.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : origQuery.call(window.navigator.permissions, params);
+    }
+
+    // 6. WebGL vendor/renderer (headless exposes SwiftShader)
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Intel Inc.';
+        if (param === 37446) return 'Intel Iris OpenGL Engine';
+        return getParam.call(this, param);
+    };
+
+    // 7. Hide automation-related console errors
+    window.navigator.getBattery && (window.navigator.getBattery = undefined);
+}"""
 
 log = logging.getLogger(__name__)
 
@@ -195,9 +242,7 @@ async def extract_dom(page: Page) -> list[dict]:
 async def scrape_term(context: BrowserContext, term: str, country: str, limit: int) -> list[dict]:
     url  = build_url(term, country)
     page = await context.new_page()
-
-    # Apply stealth BEFORE navigation
-    await stealth_async(page)
+    await page.add_init_script(STEALTH_SCRIPT)
 
     captured: list[dict] = []
 
