@@ -6,7 +6,7 @@
     "searchTerms": {
       "title": "Search Terms",
       "type": "array",
-      "description": "Keywords to search in Meta Ad Library",
+      "description": "Keywords used to search Meta Ad Library. Each term triggers a separate search run.",
       "editor": "stringList",
       "default": [
         "shop now free shipping",
@@ -16,10 +16,25 @@
         "as seen on tiktok"
       ]
     },
+    "filterKeywords": {
+      "title": "Filter Keywords (Research Targets)",
+      "type": "array",
+      "description": "Only keep brands whose domain or ad text contains at least one of these keywords. Leave empty to keep all brands.",
+      "editor": "stringList",
+      "default": []
+    },
+    "targetVerticals": {
+      "title": "Target Verticals",
+      "type": "array",
+      "description": "Only output brands classified in these verticals. Leave empty for all verticals.",
+      "editor": "stringList",
+      "default": [],
+      "example": ["beauty", "supplements", "fitness"]
+    },
     "country": {
       "title": "Country",
       "type": "string",
-      "description": "2-letter country code",
+      "description": "2-letter country code for Ad Library",
       "editor": "textfield",
       "default": "US"
     },

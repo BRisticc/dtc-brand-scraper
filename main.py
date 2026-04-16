@@ -232,6 +232,39 @@ def classify_brands(brands: list[dict]) -> list[dict]:
     return brands
 
 
+def apply_filters(
+    brands: list[dict],
+    filter_keywords: list[str],
+    target_verticals: list[str],
+) -> list[dict]:
+    """
+    Apply research filters to classified brands.
+
+    filter_keywords  — keep only brands whose domain or ad text contains
+                       at least one of these keywords (case-insensitive).
+                       Empty list = keep all.
+
+    target_verticals — keep only brands in these verticals.
+                       Empty list = keep all.
+    """
+    result = brands
+
+    if filter_keywords:
+        kws = [kw.lower() for kw in filter_keywords]
+        result = [
+            b for b in result
+            if any(kw in f"{b['domain']} {b['ad_text']}".lower() for kw in kws)
+        ]
+        log.info(f"After filterKeywords ({filter_keywords}): {len(result)} brands")
+
+    if target_verticals:
+        tvs = [v.lower() for v in target_verticals]
+        result = [b for b in result if b.get("vertical", "").lower() in tvs]
+        log.info(f"After targetVerticals ({target_verticals}): {len(result)} brands")
+
+    return result
+
+
 # ─────────────────────────────────────────
 #  ACTOR ENTRY POINT
 # ─────────────────────────────────────────
@@ -241,11 +274,18 @@ async def main() -> None:
         inp = await Actor.get_input() or {}
 
         search_terms      = inp.get("searchTerms",     ["shop now free shipping", "buy now limited offer", "try risk free"])
+        filter_keywords   = inp.get("filterKeywords",   [])
+        target_verticals  = inp.get("targetVerticals",  [])
         country           = inp.get("country",          "US")
         ads_limit         = inp.get("adsLimitPerTerm",  200)
         max_brands        = inp.get("maxBrands",        500)
 
-        log.info(f"Starting DTC scraper | terms={len(search_terms)} | limit/term={ads_limit} | country={country}")
+        log.info(
+            f"Starting DTC scraper | terms={len(search_terms)} | "
+            f"limit/term={ads_limit} | country={country} | "
+            f"filterKeywords={filter_keywords or 'all'} | "
+            f"targetVerticals={target_verticals or 'all'}"
+        )
 
         all_brands: dict[str, dict] = {}
 
@@ -283,7 +323,10 @@ async def main() -> None:
         brand_list = list(all_brands.values())[:max_brands]
         classify_brands(brand_list)
 
-        log.info(f"Total unique brands: {len(brand_list)}")
+        # Apply research filters
+        brand_list = apply_filters(brand_list, filter_keywords, target_verticals)
+
+        log.info(f"Total brands after filtering: {len(brand_list)}")
 
         # Push to Apify dataset
         await Actor.push_data(brand_list)
