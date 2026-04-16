@@ -20,6 +20,12 @@ import logging
 import re
 from urllib.parse import urlparse, urlencode
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 from apify import Actor
 from playwright.async_api import async_playwright, Page, BrowserContext
 
@@ -268,7 +274,7 @@ async def scrape_search_term(
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         # Give React time to boot and fire initial XHR
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
         await dismiss_overlays(page)
         await page.wait_for_timeout(1000)
     except Exception as e:
@@ -276,9 +282,19 @@ async def scrape_search_term(
         await page.close()
         return []
 
-    # Log page title so we know what loaded
+    # Log page title + save screenshot so we can see what browser loaded
     title = await page.title()
     log.info(f"  Page title: '{title}'")
+    try:
+        screenshot = await page.screenshot(full_page=False)
+        await Actor.set_value(
+            f"screenshot_{term[:30].replace(' ', '_')}",
+            screenshot,
+            content_type="image/png",
+        )
+        log.info("  Screenshot saved to KV store")
+    except Exception as e:
+        log.warning(f"  Screenshot failed: {e}")
 
     collected: dict[str, dict] = {}
     no_new_streak = 0
