@@ -273,18 +273,19 @@ async def scrape_search_term(
     log.info(f"Loading: {url}")
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        # Give React time to boot and fire initial XHR
         await page.wait_for_timeout(5000)
         await dismiss_overlays(page)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1500)
     except Exception as e:
         log.error(f"Navigation failed for '{term}': {e}")
         await page.close()
         return []
 
-    # Log page title + save screenshot so we can see what browser loaded
     title = await page.title()
-    log.info(f"  Page title: '{title}'")
+    # Log visible text length — helps diagnose blank vs blocked vs loaded page
+    body_text_len = await page.evaluate("() => document.body ? document.body.innerText.length : 0")
+    link_count    = await page.evaluate("() => document.querySelectorAll('a[href]').length")
+    log.info(f"  Page: title='{title}' | text_chars={body_text_len} | links={link_count}")
     try:
         screenshot = await page.screenshot(full_page=False)
         await Actor.set_value(
@@ -414,18 +415,21 @@ async def main() -> None:
 
         all_brands: dict[str, dict] = {}
 
-        # Apify residential proxy — bypasses Facebook datacenter IP blocking
+        # Proxy: try RESIDENTIAL first, fall back to datacenter (faster)
         proxy_url = None
         if use_residential_proxy:
-            try:
-                proxy_cfg = await Actor.create_proxy_configuration(
-                    groups=["RESIDENTIAL"],
-                    country_code="US",
-                )
-                proxy_url = await proxy_cfg.new_url()
-                log.info(f"Proxy configured: {proxy_url[:40]}...")
-            except Exception as e:
-                log.warning(f"Proxy not available ({e}) — running without proxy (may be blocked)")
+            for groups in (["RESIDENTIAL"], []):
+                try:
+                    proxy_cfg = await Actor.create_proxy_configuration(
+                        groups=groups,
+                        country_code="US",
+                    )
+                    proxy_url = await proxy_cfg.new_url()
+                    label = "residential" if groups else "datacenter"
+                    log.info(f"Proxy configured ({label}): {proxy_url[:40]}...")
+                    break
+                except Exception as e:
+                    log.warning(f"Proxy group {groups} unavailable: {e}")
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
