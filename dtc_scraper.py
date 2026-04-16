@@ -2,6 +2,8 @@
 DTC Brand Scraper + Vertical Classifier
 ========================================
 100% Apify infrastructure — no LLM, no local HTTP calls.
+Designed to run as an Apify actor (GitHub integration).
+APIFY_API_TOKEN is injected automatically by the platform.
 
 Pipeline:
   1. Apify: facebook-ads-library-scraper  → raw ads
@@ -11,30 +13,21 @@ Pipeline:
   5. Keyword-classify again with homepage text
   6. Save results to CSV + Apify dataset
 
-Requirements:
-    pip install apify-client python-dotenv
-
-Usage:
-    cp .env.example .env   # fill in APIFY_API_TOKEN
-    python dtc_scraper.py
+Local development:
+    pip install apify-client
+    APIFY_API_TOKEN=xxx python dtc_scraper.py
 """
 
-import os
 import csv
 import time
 import logging
 from urllib.parse import urlparse
 
 from apify_client import ApifyClient
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ─────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
-
 ADS_LIMIT_PER_TERM    = 200   # ads per search term (~$0.50 / 1000 results)
 MAX_SITES_TO_CLASSIFY = 500   # max brands to process
 OUTPUT_CSV            = "dtc_brands.csv"
@@ -412,11 +405,8 @@ def print_summary(brands: list[dict]) -> None:
 def main() -> None:
     log.info("DTC Brand Scraper starting (Apify-only mode)...")
 
-    if not APIFY_API_TOKEN:
-        log.error("Set APIFY_API_TOKEN in .env or as environment variable before running.")
-        return
-
-    client = ApifyClient(APIFY_API_TOKEN)
+    # ApifyClient automatically picks up APIFY_API_TOKEN from the environment
+    client = ApifyClient()
 
     # 1. Scrape ads
     ads = scrape_meta_ads(client, SEARCH_TERMS, ADS_LIMIT_PER_TERM)
