@@ -53,6 +53,12 @@
       "default": 500,
       "minimum": 10,
       "maximum": 5000
+    },
+    "useResidentialProxy": {
+      "title": "Use Residential Proxy",
+      "type": "boolean",
+      "description": "Enable Apify residential proxies to bypass Facebook IP blocking. Requires proxy credits.",
+      "default": true
     }
   }
 }

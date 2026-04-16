@@ -401,16 +401,31 @@ async def main() -> None:
         filter_keywords  = inp.get("filterKeywords",  [])
         target_verticals = inp.get("targetVerticals", [])
         country          = inp.get("country",         "US")
-        ads_limit        = inp.get("adsLimitPerTerm", 200)
-        max_brands       = inp.get("maxBrands",       500)
+        ads_limit            = inp.get("adsLimitPerTerm",       200)
+        max_brands           = inp.get("maxBrands",             500)
+        use_residential_proxy = inp.get("useResidentialProxy",  True)
 
         log.info(
             f"DTC Scraper | terms={len(search_terms)} | "
             f"limit/term={ads_limit} | country={country} | "
-            f"filter={filter_keywords or 'none'} | verticals={target_verticals or 'all'}"
+            f"filter={filter_keywords or 'none'} | verticals={target_verticals or 'all'} | "
+            f"proxy={'residential' if use_residential_proxy else 'none'}"
         )
 
         all_brands: dict[str, dict] = {}
+
+        # Apify residential proxy — bypasses Facebook datacenter IP blocking
+        proxy_url = None
+        if use_residential_proxy:
+            try:
+                proxy_cfg = await Actor.create_proxy_configuration(
+                    groups=["RESIDENTIAL"],
+                    country_code="US",
+                )
+                proxy_url = await proxy_cfg.new_url()
+                log.info(f"Proxy configured: {proxy_url[:40]}...")
+            except Exception as e:
+                log.warning(f"Proxy not available ({e}) — running without proxy (may be blocked)")
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
@@ -421,6 +436,7 @@ async def main() -> None:
                     "--disable-blink-features=AutomationControlled",
                     "--disable-web-security",
                 ],
+                proxy={"server": proxy_url} if proxy_url else None,
             )
             context = await browser.new_context(
                 user_agent=(
@@ -434,6 +450,14 @@ async def main() -> None:
                     "Accept-Language": "en-US,en;q=0.9",
                 },
             )
+
+            # Remove webdriver fingerprint that Facebook detects
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+            """)
 
             for term in search_terms:
                 brands = await scrape_search_term(context, term, country, ads_limit)
