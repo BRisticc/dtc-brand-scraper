@@ -272,7 +272,7 @@ async def scrape_search_term(
 
     log.info(f"Loading: {url}")
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         # Give React time to boot and fire initial XHR
         await page.wait_for_timeout(5000)
         await dismiss_overlays(page)
