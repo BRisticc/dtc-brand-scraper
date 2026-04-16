@@ -187,44 +187,44 @@ def parse_graphql(text: str) -> list[dict]:
 # ─────────────────────────────────────────
 
 async def extract_dom(page: Page) -> list[dict]:
-    """Extract advertiser links visible in DOM (fallback if GraphQL gives nothing)."""
+    """Extract advertiser links from DOM. Catches all external <a> tags."""
     return await page.evaluate("""
         () => {
             const out  = [];
             const seen = new Set();
-            // Any link pointing outside Facebook in a new tab or with noopener
-            const links = [
-                ...document.querySelectorAll('a[href][target="_blank"]'),
-                ...document.querySelectorAll('a[href][rel*="noopener"]'),
-            ];
-            for (const a of links) {
+            const skip = ['facebook.com','fb.com','instagram.com','fb.watch',
+                          'metastatus.com','fbcdn.net','fbsbx.com','fburl.com'];
+
+            // All anchor tags with href (no filter on target)
+            for (const a of document.querySelectorAll('a[href]')) {
                 const href = a.href || '';
                 if (!href.startsWith('http')) continue;
                 try {
                     const u = new URL(href);
                     const d = u.hostname.replace(/^www\\./, '');
-                    const skip = ['facebook.com','fb.com','instagram.com','fb.watch','metastatus.com','fbcdn.net'];
-                    if (!d || seen.has(d) || skip.some(s => d.endsWith(s))) continue;
+                    if (!d || !d.includes('.')) continue;
+                    if (seen.has(d)) continue;
+                    if (skip.some(s => d.endsWith(s) || d.includes(s))) continue;
                     seen.add(d);
 
-                    // Walk up to find ad card
+                    // Walk up to find ad card (max 20 levels)
                     let card = a;
-                    for (let i = 0; i < 15; i++) {
+                    for (let i = 0; i < 20; i++) {
                         if (!card.parentElement) break;
                         card = card.parentElement;
-                        if (card.innerText && card.innerText.length > 80) break;
+                        if ((card.innerText || '').length > 100) break;
                     }
+
                     let advertiser = '', adText = '';
-                    const fbLinks = card.querySelectorAll('a[href*="facebook.com"]');
-                    for (const fl of fbLinks) {
+                    for (const fl of card.querySelectorAll('a[href*="facebook.com"]')) {
                         const t = (fl.innerText || '').trim();
                         if (t.length > 1 && t.length < 80) { advertiser = t; break; }
                     }
-                    const spans = card.querySelectorAll('span, p');
-                    for (const el of spans) {
+                    for (const el of card.querySelectorAll('span,p,div')) {
                         const t = (el.innerText || '').trim();
-                        if (t.length > 30 && t.length < 300) { adText = t; break; }
+                        if (t.length > 25 && t.length < 300) { adText = t; break; }
                     }
+
                     out.push({ domain: d, website: 'https://' + d,
                                advertiser: advertiser || 'Unknown',
                                ad_text: adText.slice(0, 200), source: 'dom' });
@@ -288,17 +288,28 @@ async def scrape_term(context: BrowserContext, term: str, country: str, limit: i
     txt_len  = await page.evaluate("() => document.body?.innerText?.length || 0")
     log.info(f"  title='{title}' text_chars={txt_len}")
 
-    # Save screenshot for first term (diagnostic)
-    if "shop now" in term or True:
-        try:
-            shot = await page.screenshot()
-            await Actor.set_value(
-                f"ss_{term[:20].replace(' ','_')}",
-                shot,
-                content_type="image/png",
-            )
-        except Exception:
-            pass
+    # Debug: count all links and sample external ones
+    link_debug = await page.evaluate("""
+        () => {
+            const all   = document.querySelectorAll('a[href]');
+            const ext   = [...all].filter(a => {
+                try { return !new URL(a.href).hostname.includes('facebook'); } catch(e) { return false; }
+            });
+            const blank = [...all].filter(a => a.target === '_blank');
+            const sample = ext.slice(0, 5).map(a => a.href);
+            return { total: all.length, external: ext.length, blank: blank.length, sample };
+        }
+    """)
+    log.info(f"  links: total={link_debug['total']} external={link_debug['external']} blank={link_debug['blank']}")
+    if link_debug['sample']:
+        log.info(f"  sample external: {link_debug['sample']}")
+
+    # Screenshot
+    try:
+        shot = await page.screenshot()
+        await Actor.set_value(f"ss_{term[:20].replace(' ','_')}", shot, content_type="image/png")
+    except Exception:
+        pass
 
     collected: dict[str, dict] = {}
     no_new = 0
@@ -379,7 +390,7 @@ async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms     = inp.get("searchTerms",     ["shop now free shipping", "buy now limited offer"])
+        search_terms     = inp.get("searchTerms",     ["skincare", "supplements", "coffee", "fitness", "sneakers"])
         filter_kws       = inp.get("filterKeywords",  [])
         target_verts     = inp.get("targetVerticals", [])
         country          = inp.get("country",         "US")
