@@ -1,23 +1,22 @@
 """
 DTC Brand Scraper — Apify Actor
 ================================
-Scrapes Meta Ad Library via Playwright + GraphQL interception.
-Primary: captures XHR/GraphQL API responses (structured JSON).
-Fallback: HTML extraction of CTA links from ad cards.
+Playwright + stealth mode scraper for Meta Ad Library.
+Intercepts GraphQL API responses for structured ad data.
+Falls back to DOM extraction if GraphQL yields nothing.
 
-Input (Apify UI):
+Input:
     searchTerms      list[str]
-    filterKeywords   list[str]   (optional, filters results)
-    targetVerticals  list[str]   (optional, filters results)
-    country          str
-    adsLimitPerTerm  int
-    maxBrands        int
+    filterKeywords   list[str]   (optional)
+    targetVerticals  list[str]   (optional)
+    country          str         (default: US)
+    adsLimitPerTerm  int         (default: 200)
+    maxBrands        int         (default: 500)
 """
 
 import asyncio
 import json
 import logging
-import re
 from urllib.parse import urlparse, urlencode
 
 logging.basicConfig(
@@ -28,6 +27,7 @@ logging.basicConfig(
 
 from apify import Actor
 from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright_stealth import stealth_async
 
 from classifier import classify, confidence_label
 
@@ -42,20 +42,18 @@ SCROLL_WAIT_MS  = 2500
 #  HELPERS
 # ─────────────────────────────────────────
 
-def build_search_url(term: str, country: str) -> str:
-    params = {
+def build_url(term: str, country: str) -> str:
+    return f"{AD_LIBRARY_BASE}?" + urlencode({
         "active_status": "all",
         "ad_type":       "all",
         "country":       country,
         "q":             term,
         "search_type":   "keyword_unordered",
         "media_type":    "all",
-    }
-    return f"{AD_LIBRARY_BASE}?{urlencode(params)}"
+    })
 
 
 def extract_domain(url: str) -> str | None:
-    """Return clean domain from URL, or None if invalid/Facebook."""
     if not url or not url.startswith("http"):
         return None
     try:
@@ -71,365 +69,281 @@ def extract_domain(url: str) -> str | None:
 #  GRAPHQL RESPONSE PARSER
 # ─────────────────────────────────────────
 
-def _find_ads_recursive(node: object, results: list) -> None:
+def _find_ads(node: object, out: list) -> None:
     """
-    Walk any JSON structure and collect objects that look like ad entries.
-    Facebook's GraphQL response nests ad data deeply — we don't rely on
-    a fixed schema, just look for objects containing page_name + a URL.
+    Recursively walk JSON and collect ad-like objects.
+    Handles both snake_case and camelCase field names from Facebook.
     """
     if isinstance(node, dict):
-        page_name = node.get("page_name") or node.get("advertiser_name") or ""
-        snapshot  = node.get("snapshot") or {}
+        # Field name variations Facebook uses
+        page_name = (
+            node.get("page_name")
+            or node.get("pageName")
+            or node.get("advertiser_name")
+            or ""
+        )
+        snapshot = node.get("snapshot") or {}
 
-        # Candidate CTA URLs in order of preference
         link_url = (
-            (snapshot.get("link_url") if isinstance(snapshot, dict) else None)
-            or (snapshot.get("website_url") if isinstance(snapshot, dict) else None)
-            or node.get("link_url")
-            or node.get("website_url")
+            (snapshot.get("link_url") or snapshot.get("linkUrl") if isinstance(snapshot, dict) else None)
+            or node.get("link_url") or node.get("linkUrl")
+            or node.get("website_url") or node.get("websiteUrl")
             or ""
         )
 
-        # Ad body text
-        body = ""
-        if isinstance(snapshot, dict):
-            body_node = snapshot.get("body") or {}
-            body = (
-                (body_node.get("markup") if isinstance(body_node, dict) else body_node)
-                or snapshot.get("title")
-                or snapshot.get("caption")
-                or ""
-            )
-
-        domain = extract_domain(str(link_url))
-        if page_name and domain:
-            results.append({
-                "domain":     domain,
-                "website":    f"https://{domain}",
-                "advertiser": str(page_name)[:80],
-                "ad_text":    str(body)[:200],
-                "cta_url":    str(link_url),
-                "source":     "graphql",
-            })
+        if page_name and link_url:
+            domain = extract_domain(str(link_url))
+            if domain:
+                body = ""
+                if isinstance(snapshot, dict):
+                    b = snapshot.get("body") or {}
+                    body = (b.get("markup") if isinstance(b, dict) else str(b)) or snapshot.get("title", "")
+                out.append({
+                    "domain":     domain,
+                    "website":    f"https://{domain}",
+                    "advertiser": str(page_name)[:80],
+                    "ad_text":    str(body)[:200],
+                    "source":     "graphql",
+                })
 
         for v in node.values():
-            _find_ads_recursive(v, results)
+            _find_ads(v, out)
 
     elif isinstance(node, list):
         for item in node:
-            _find_ads_recursive(item, results)
+            _find_ads(item, out)
 
 
-def parse_graphql_response(text: str) -> list[dict]:
-    """Parse a raw GraphQL response body and extract ad entries."""
-    results: list[dict] = []
+def parse_graphql(text: str) -> list[dict]:
+    out: list[dict] = []
+    # Try whole body first (single large JSON object)
     try:
-        # Facebook sometimes returns multiple JSON objects on separate lines
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                _find_ads_recursive(data, results)
-            except json.JSONDecodeError:
-                pass
-    except Exception as e:
-        log.debug(f"GraphQL parse error: {e}")
-    return results
+        _find_ads(json.loads(text), out)
+        if out:
+            return out
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try line-by-line (streamed / multi-object responses)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            _find_ads(json.loads(line), out)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return out
 
 
 # ─────────────────────────────────────────
-#  HTML FALLBACK EXTRACTOR
+#  DOM FALLBACK EXTRACTOR
 # ─────────────────────────────────────────
 
-async def extract_ads_html_fallback(page: Page) -> list[dict]:
-    """
-    Fallback: find CTA links (target=_blank to external domains) on the page.
-    Only used if GraphQL interception yielded nothing.
-    """
-    ads = await page.evaluate("""
+async def extract_dom(page: Page) -> list[dict]:
+    """Extract advertiser links visible in DOM (fallback if GraphQL gives nothing)."""
+    return await page.evaluate("""
         () => {
-            const results = [];
-            const seen    = new Set();
-
-            // Target links that open in new tab (CTA buttons) to external domains
-            const links = Array.from(document.querySelectorAll('a[href][target="_blank"], a[href][rel*="noopener"]'));
-
-            for (const link of links) {
-                const href = link.href || '';
+            const out  = [];
+            const seen = new Set();
+            // Any link pointing outside Facebook in a new tab or with noopener
+            const links = [
+                ...document.querySelectorAll('a[href][target="_blank"]'),
+                ...document.querySelectorAll('a[href][rel*="noopener"]'),
+            ];
+            for (const a of links) {
+                const href = a.href || '';
                 if (!href.startsWith('http')) continue;
-
                 try {
-                    const url    = new URL(href);
-                    const domain = url.hostname.replace(/^www\\./, '');
-                    const skip   = ['facebook.com','fb.com','instagram.com','fb.watch','metastatus.com'];
+                    const u = new URL(href);
+                    const d = u.hostname.replace(/^www\\./, '');
+                    const skip = ['facebook.com','fb.com','instagram.com','fb.watch','metastatus.com','fbcdn.net'];
+                    if (!d || seen.has(d) || skip.some(s => d.endsWith(s))) continue;
+                    seen.add(d);
 
-                    if (!domain || seen.has(domain)) continue;
-                    if (skip.some(s => domain.includes(s))) continue;
-                    if (!domain.includes('.')) continue;
-
-                    seen.add(domain);
-
-                    // Walk up max 15 levels to find the ad card
-                    let card = link;
+                    // Walk up to find ad card
+                    let card = a;
                     for (let i = 0; i < 15; i++) {
                         if (!card.parentElement) break;
                         card = card.parentElement;
-                        // Stop at a "large enough" container
-                        if (card.innerText && card.innerText.length > 100) break;
+                        if (card.innerText && card.innerText.length > 80) break;
                     }
-
-                    // Advertiser: look for FB page links within the card
-                    let advertiser = '';
-                    const fbLinks = card.querySelectorAll('a[href*="facebook.com/"]');
+                    let advertiser = '', adText = '';
+                    const fbLinks = card.querySelectorAll('a[href*="facebook.com"]');
                     for (const fl of fbLinks) {
                         const t = (fl.innerText || '').trim();
                         if (t.length > 1 && t.length < 80) { advertiser = t; break; }
                     }
-
-                    // Ad text: first substantial text block
-                    let adText = '';
-                    const texts = card.querySelectorAll('span, p');
-                    for (const el of texts) {
+                    const spans = card.querySelectorAll('span, p');
+                    for (const el of spans) {
                         const t = (el.innerText || '').trim();
                         if (t.length > 30 && t.length < 300) { adText = t; break; }
                     }
-
-                    results.push({
-                        domain:     domain,
-                        website:    'https://' + domain,
-                        advertiser: advertiser || 'Unknown',
-                        ad_text:    adText.slice(0, 200),
-                        cta_url:    href,
-                        source:     'html_fallback',
-                    });
-                } catch (e) { continue; }
+                    out.push({ domain: d, website: 'https://' + d,
+                               advertiser: advertiser || 'Unknown',
+                               ad_text: adText.slice(0, 200), source: 'dom' });
+                } catch(e) {}
             }
-            return results;
+            return out;
         }
-    """)
-    return ads or []
+    """) or []
 
 
 # ─────────────────────────────────────────
-#  OVERLAY DISMISSAL
+#  SCRAPE ONE SEARCH TERM
 # ─────────────────────────────────────────
 
-async def dismiss_overlays(page: Page) -> None:
-    """Dismiss cookie banners, login prompts, and other overlays."""
-    selectors = [
-        '[data-testid="cookie-policy-manage-dialog"] button',
-        'div[role="dialog"] [aria-label="Close"]',
-        '[aria-label="Close"]',
-        'button[title="Close"]',
-        '[data-cookiebanner] button',
-        # Facebook "Continue without logging in" or similar
-        'div[role="dialog"] button:last-child',
-    ]
-    for sel in selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1000):
-                await btn.click()
-                await page.wait_for_timeout(600)
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────
-#  CORE SCRAPER
-# ─────────────────────────────────────────
-
-async def scrape_search_term(
-    context: BrowserContext,
-    term: str,
-    country: str,
-    limit: int,
-) -> list[dict]:
-    url  = build_search_url(term, country)
+async def scrape_term(context: BrowserContext, term: str, country: str, limit: int) -> list[dict]:
+    url  = build_url(term, country)
     page = await context.new_page()
 
-    # Collect all GraphQL responses for this page
-    graphql_ads: list[dict] = []
+    # Apply stealth BEFORE navigation
+    await stealth_async(page)
+
+    captured: list[dict] = []
 
     async def on_response(response):
-        if "api/graphql" not in response.url and "graphql" not in response.url:
+        url_str = response.url
+        if "api/graphql" not in url_str and "graphql" not in url_str:
             return
         try:
             text = await response.text()
-            # Quick check before full parse
-            if "page_name" not in text and "advertiser_name" not in text:
+            if len(text) < 50:
                 return
-            found = parse_graphql_response(text)
-            if found:
-                log.debug(f"  GraphQL batch: +{len(found)} ads")
-                graphql_ads.extend(found)
+            ads = parse_graphql(text)
+            if ads:
+                log.debug(f"  GQL batch +{len(ads)}")
+                captured.extend(ads)
         except Exception:
             pass
 
     page.on("response", on_response)
 
-    log.info(f"Loading: {url}")
+    log.info(f"→ '{term}'")
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(5000)
-        await dismiss_overlays(page)
-        await page.wait_for_timeout(1500)
+
+        # Dismiss any overlays
+        for sel in ['[aria-label="Close"]', '[data-testid*="cookie"] button',
+                    'div[role="dialog"] button:last-child']:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=800):
+                    await btn.click()
+                    await page.wait_for_timeout(500)
+            except Exception:
+                pass
+
     except Exception as e:
-        log.error(f"Navigation failed for '{term}': {e}")
+        log.error(f"  Nav failed: {e}")
         await page.close()
         return []
 
-    title = await page.title()
-    # Log visible text length — helps diagnose blank vs blocked vs loaded page
-    body_text_len = await page.evaluate("() => document.body ? document.body.innerText.length : 0")
-    link_count    = await page.evaluate("() => document.querySelectorAll('a[href]').length")
-    log.info(f"  Page: title='{title}' | text_chars={body_text_len} | links={link_count}")
-    try:
-        screenshot = await page.screenshot(full_page=False)
-        await Actor.set_value(
-            f"screenshot_{term[:30].replace(' ', '_')}",
-            screenshot,
-            content_type="image/png",
-        )
-        log.info("  Screenshot saved to KV store")
-    except Exception as e:
-        log.warning(f"  Screenshot failed: {e}")
+    title    = await page.title()
+    txt_len  = await page.evaluate("() => document.body?.innerText?.length || 0")
+    log.info(f"  title='{title}' text_chars={txt_len}")
+
+    # Save screenshot for first term (diagnostic)
+    if "shop now" in term or True:
+        try:
+            shot = await page.screenshot()
+            await Actor.set_value(
+                f"ss_{term[:20].replace(' ','_')}",
+                shot,
+                content_type="image/png",
+            )
+        except Exception:
+            pass
 
     collected: dict[str, dict] = {}
-    no_new_streak = 0
+    no_new = 0
 
-    # Scroll loop
-    for scroll_num in range(150):  # hard cap
+    for scroll_n in range(200):
         if len(collected) >= limit:
             break
 
-        # Merge latest GraphQL results
         before = len(collected)
-        for ad in graphql_ads:
+
+        # Merge GraphQL captures
+        for ad in captured:
             if ad["domain"] not in collected:
                 collected[ad["domain"]] = ad
-        graphql_ads.clear()
+        captured.clear()
 
-        new_from_graphql = len(collected) - before
-
-        # If GraphQL gave nothing, try HTML fallback
-        new_from_html = 0
-        if new_from_graphql == 0:
-            html_ads = await extract_ads_html_fallback(page)
-            for ad in html_ads:
+        # DOM fallback if GraphQL gave nothing this round
+        if len(collected) == before:
+            dom_ads = await extract_dom(page)
+            for ad in dom_ads:
                 if ad["domain"] not in collected:
                     collected[ad["domain"]] = ad
-                    new_from_html += 1
 
-        total_new = new_from_graphql + new_from_html
-        log.info(
-            f"  Scroll {scroll_num+1} | '{term}' | "
-            f"total={len(collected)} (+gql={new_from_graphql} +html={new_from_html})"
-        )
+        new = len(collected) - before
+        log.info(f"  scroll {scroll_n+1} | brands={len(collected)} +{new}")
 
-        if total_new == 0:
-            no_new_streak += 1
-            if no_new_streak >= 4:
-                log.info(f"  No new ads for 4 scrolls — stopping '{term}'")
+        if new == 0:
+            no_new += 1
+            if no_new >= 5:
+                log.info(f"  5 empty scrolls — done")
                 break
         else:
-            no_new_streak = 0
+            no_new = 0
 
-        # Scroll down
         await page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})")
         await page.wait_for_timeout(SCROLL_WAIT_MS)
 
-        # Check bottom
         at_bottom = await page.evaluate(
-            "(window.innerHeight + window.scrollY) >= document.body.scrollHeight - 300"
+            "(window.innerHeight + window.scrollY) >= document.body.scrollHeight - 400"
         )
-        if at_bottom and scroll_num > 2:
-            log.info(f"  Reached bottom for '{term}'")
+        if at_bottom and scroll_n > 2:
+            log.info(f"  page bottom")
             break
 
     await page.close()
-    log.info(f"Done '{term}': {len(collected)} unique brands")
+    log.info(f"  Done: {len(collected)} brands")
     return list(collected.values())
 
 
 # ─────────────────────────────────────────
-#  CLASSIFICATION + FILTERS
+#  CLASSIFY + FILTER
 # ─────────────────────────────────────────
 
-def classify_brands(brands: list[dict]) -> None:
-    for brand in brands:
-        text            = f"{brand['domain']} {brand['ad_text']}"
-        vertical, score = classify(text)
-        brand["vertical"]   = vertical
-        brand["confidence"] = confidence_label(score)
-        brand["kw_score"]   = score
+def classify_all(brands: list[dict]) -> None:
+    for b in brands:
+        v, s = classify(f"{b['domain']} {b['ad_text']}")
+        b["vertical"]   = v
+        b["confidence"] = confidence_label(s)
 
 
-def apply_filters(
-    brands: list[dict],
-    filter_keywords: list[str],
-    target_verticals: list[str],
-) -> list[dict]:
-    result = brands
-
-    if filter_keywords:
-        kws    = [kw.lower() for kw in filter_keywords]
-        result = [
-            b for b in result
-            if any(kw in f"{b['domain']} {b['ad_text']}".lower() for kw in kws)
-        ]
-        log.info(f"After filterKeywords: {len(result)} brands")
-
-    if target_verticals:
-        tvs    = [v.lower() for v in target_verticals]
-        result = [b for b in result if b.get("vertical", "").lower() in tvs]
-        log.info(f"After targetVerticals: {len(result)} brands")
-
-    return result
+def apply_filters(brands, filter_kws, target_verts):
+    if filter_kws:
+        kws    = [k.lower() for k in filter_kws]
+        brands = [b for b in brands if any(k in f"{b['domain']} {b['ad_text']}".lower() for k in kws)]
+        log.info(f"After filterKeywords: {len(brands)}")
+    if target_verts:
+        tvs    = [v.lower() for v in target_verts]
+        brands = [b for b in brands if b.get("vertical", "") in tvs]
+        log.info(f"After targetVerticals: {len(brands)}")
+    return brands
 
 
 # ─────────────────────────────────────────
-#  ACTOR ENTRY POINT
+#  MAIN
 # ─────────────────────────────────────────
 
 async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms     = inp.get("searchTerms",    ["shop now free shipping", "buy now limited offer"])
-        filter_keywords  = inp.get("filterKeywords",  [])
-        target_verticals = inp.get("targetVerticals", [])
+        search_terms     = inp.get("searchTerms",     ["shop now free shipping", "buy now limited offer"])
+        filter_kws       = inp.get("filterKeywords",  [])
+        target_verts     = inp.get("targetVerticals", [])
         country          = inp.get("country",         "US")
-        ads_limit            = inp.get("adsLimitPerTerm",       200)
-        max_brands           = inp.get("maxBrands",             500)
-        use_residential_proxy = inp.get("useResidentialProxy",  True)
+        ads_limit        = inp.get("adsLimitPerTerm", 200)
+        max_brands       = inp.get("maxBrands",       500)
 
-        log.info(
-            f"DTC Scraper | terms={len(search_terms)} | "
-            f"limit/term={ads_limit} | country={country} | "
-            f"filter={filter_keywords or 'none'} | verticals={target_verticals or 'all'} | "
-            f"proxy={'residential' if use_residential_proxy else 'none'}"
-        )
+        log.info(f"Starting | terms={len(search_terms)} | country={country} | limit={ads_limit}")
 
         all_brands: dict[str, dict] = {}
-
-        # Proxy: try RESIDENTIAL first, fall back to datacenter (faster)
-        proxy_url = None
-        if use_residential_proxy:
-            for groups in (["RESIDENTIAL"], []):
-                try:
-                    proxy_cfg = await Actor.create_proxy_configuration(
-                        groups=groups,
-                        country_code="US",
-                    )
-                    proxy_url = await proxy_cfg.new_url()
-                    label = "residential" if groups else "datacenter"
-                    log.info(f"Proxy configured ({label}): {proxy_url[:40]}...")
-                    break
-                except Exception as e:
-                    log.warning(f"Proxy group {groups} unavailable: {e}")
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
@@ -438,52 +352,40 @@ async def main() -> None:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-web-security",
                 ],
-                proxy={"server": proxy_url} if proxy_url else None,
             )
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
+                    "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
 
-            # Remove webdriver fingerprint that Facebook detects
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
-            """)
-
             for term in search_terms:
-                brands = await scrape_search_term(context, term, country, ads_limit)
+                brands = await scrape_term(context, term, country, ads_limit)
                 for b in brands:
                     if b["domain"] not in all_brands:
                         all_brands[b["domain"]] = b
                 if len(all_brands) >= max_brands:
-                    log.info(f"Reached maxBrands cap ({max_brands})")
                     break
 
             await browser.close()
 
-        brand_list = list(all_brands.values())[:max_brands]
-        classify_brands(brand_list)
-        brand_list = apply_filters(brand_list, filter_keywords, target_verticals)
+        result = list(all_brands.values())[:max_brands]
+        classify_all(result)
+        result = apply_filters(result, filter_kws, target_verts)
 
-        log.info(f"Pushing {len(brand_list)} brands to dataset")
-        await Actor.push_data(brand_list)
+        log.info(f"Pushing {len(result)} brands")
+        await Actor.push_data(result)
 
         from collections import Counter
-        v = Counter(b["vertical"] for b in brand_list)
-        log.info("Verticals: " + " | ".join(f"{k}:{c}" for k, c in v.most_common()))
+        log.info("Verticals: " + " | ".join(
+            f"{k}:{c}" for k, c in Counter(b["vertical"] for b in result).most_common()
+        ))
 
 
 if __name__ == "__main__":
