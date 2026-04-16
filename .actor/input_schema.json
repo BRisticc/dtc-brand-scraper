@@ -1,0 +1,43 @@
+{
+  "title": "DTC Brand Scraper",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "searchTerms": {
+      "title": "Search Terms",
+      "type": "array",
+      "description": "Keywords to search in Meta Ad Library",
+      "editor": "stringList",
+      "default": [
+        "shop now free shipping",
+        "buy now limited offer",
+        "try risk free",
+        "subscribe and save",
+        "as seen on tiktok"
+      ]
+    },
+    "country": {
+      "title": "Country",
+      "type": "string",
+      "description": "2-letter country code",
+      "editor": "textfield",
+      "default": "US"
+    },
+    "adsLimitPerTerm": {
+      "title": "Ads Limit Per Term",
+      "type": "integer",
+      "description": "How many ads to scroll through per search term",
+      "default": 200,
+      "minimum": 20,
+      "maximum": 2000
+    },
+    "maxBrands": {
+      "title": "Max Brands to Output",
+      "type": "integer",
+      "description": "Cap on unique brands in final dataset",
+      "default": 500,
+      "minimum": 10,
+      "maximum": 5000
+    }
+  }
+}
