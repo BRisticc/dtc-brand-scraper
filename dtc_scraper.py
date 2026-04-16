@@ -33,7 +33,7 @@ load_dotenv()
 # ─────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "YOUR_APIFY_TOKEN_HERE")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
 
 ADS_LIMIT_PER_TERM    = 200   # ads per search term (~$0.50 / 1000 results)
 MAX_SITES_TO_CLASSIFY = 500   # max brands to process
@@ -412,8 +412,8 @@ def print_summary(brands: list[dict]) -> None:
 def main() -> None:
     log.info("DTC Brand Scraper starting (Apify-only mode)...")
 
-    if "YOUR_" in APIFY_API_TOKEN:
-        log.error("Set APIFY_API_TOKEN in .env before running.")
+    if not APIFY_API_TOKEN:
+        log.error("Set APIFY_API_TOKEN in .env or as environment variable before running.")
         return
 
     client = ApifyClient(APIFY_API_TOKEN)
