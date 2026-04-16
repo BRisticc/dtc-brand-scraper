@@ -1,0 +1,7 @@
+.env
+.DS_Store
+*.csv
+*.xlsx
+__pycache__/
+*.pyc
+dtc_brands.csv
