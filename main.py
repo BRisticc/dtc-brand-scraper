@@ -89,14 +89,14 @@ SCROLL_WAIT_MS  = 2500
 #  HELPERS
 # ─────────────────────────────────────────
 
-def build_url(term: str, country: str) -> str:
+def build_url(term: str, country: str, is_targeted: bool = False) -> str:
     from urllib.parse import quote
     return (
         f"{AD_LIBRARY_BASE}"
         f"?active_status=active"
         f"&ad_type=all"
         f"&country={country}"
-        f"&is_targeted_country=false"
+        f"&is_targeted_country={'true' if is_targeted else 'false'}"
         f"&media_type=all"
         f"&q={quote(term)}"
         f"&search_type=keyword_unordered"
@@ -263,8 +263,8 @@ async def extract_dom(page: Page) -> list[dict]:
 #  SCRAPE ONE SEARCH TERM
 # ─────────────────────────────────────────
 
-async def scrape_term(context: BrowserContext, term: str, country: str, limit: int) -> list[dict]:
-    url  = build_url(term, country)
+async def scrape_term(context: BrowserContext, term: str, country: str, limit: int, is_targeted: bool = False) -> list[dict]:
+    url  = build_url(term, country, is_targeted)
     page = await context.new_page()
     await page.add_init_script(STEALTH_SCRIPT)
 
@@ -414,12 +414,13 @@ async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms     = inp.get("searchTerms",     ["belts"])
-        filter_kws       = inp.get("filterKeywords",  [])
-        target_verts     = inp.get("targetVerticals", [])
-        country          = inp.get("country",         "ALL")
-        ads_limit        = inp.get("adsLimitPerTerm", 200)
-        max_brands       = inp.get("maxBrands",       500)
+        search_terms     = inp.get("searchTerms",        ["belts"])
+        filter_kws       = inp.get("filterKeywords",     [])
+        target_verts     = inp.get("targetVerticals",    [])
+        country          = inp.get("country",            "ALL")
+        is_targeted      = inp.get("isTargetedCountry",  False)
+        ads_limit        = inp.get("adsLimitPerTerm",    200)
+        max_brands       = inp.get("maxBrands",          500)
 
         log.info(f"Starting | terms={len(search_terms)} | country={country} | limit={ads_limit}")
 
@@ -446,7 +447,7 @@ async def main() -> None:
             )
 
             for term in search_terms:
-                brands = await scrape_term(context, term, country, ads_limit)
+                brands = await scrape_term(context, term, country, ads_limit, is_targeted)
                 for b in brands:
                     if b["domain"] not in all_brands:
                         all_brands[b["domain"]] = b

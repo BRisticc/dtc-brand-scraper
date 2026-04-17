@@ -34,9 +34,17 @@
     "country": {
       "title": "Country",
       "type": "string",
-      "description": "2-letter country code for Ad Library",
-      "editor": "textfield",
+      "description": "2-letter country code or ALL. Common codes: US, GB, CA, AU, DE, FR, IT, ES, NL, BR, IN, MX, SE, NO, DK, PL, PT, BE, CH, AT, AE, SG, ZA",
+      "editor": "select",
+      "enum": ["ALL", "US", "GB", "CA", "AU", "DE", "FR", "IT", "ES", "NL", "BR", "IN", "MX", "SE", "NO", "DK", "PL", "PT", "BE", "CH", "AT", "AE", "SG", "ZA"],
+      "enumTitles": ["All Countries", "United States", "United Kingdom", "Canada", "Australia", "Germany", "France", "Italy", "Spain", "Netherlands", "Brazil", "India", "Mexico", "Sweden", "Norway", "Denmark", "Poland", "Portugal", "Belgium", "Switzerland", "Austria", "UAE", "Singapore", "South Africa"],
       "default": "ALL"
+    },
+    "isTargetedCountry": {
+      "title": "Targeted Country Only",
+      "type": "boolean",
+      "description": "When ON: shows only ads specifically targeted TO this country. When OFF: shows all ads that reached this country (broader results).",
+      "default": false
     },
     "adsLimitPerTerm": {
       "title": "Ads Limit Per Term",
