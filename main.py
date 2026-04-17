@@ -90,7 +90,6 @@ SCROLL_WAIT_MS  = 2500
 # ─────────────────────────────────────────
 
 def build_url(term: str, country: str) -> str:
-    # active + sorted by impressions = biggest active spenders first
     from urllib.parse import quote
     return (
         f"{AD_LIBRARY_BASE}"
@@ -104,6 +103,8 @@ def build_url(term: str, country: str) -> str:
         f"&sort_data[direction]=desc"
         f"&sort_data[mode]=total_impressions"
     )
+
+
 
 
 def extract_domain(url: str) -> str | None:
@@ -193,27 +194,44 @@ def parse_graphql(text: str) -> list[dict]:
 # ─────────────────────────────────────────
 
 async def extract_dom(page: Page) -> list[dict]:
-    """Extract advertiser links from DOM. Catches all external <a> tags."""
+    """
+    Extract advertiser CTA links from DOM.
+    Facebook wraps all outbound links as l.facebook.com/l.php?u=REAL_URL —
+    we unwrap those to get the actual advertiser domain.
+    """
     return await page.evaluate("""
         () => {
             const out  = [];
             const seen = new Set();
-            const skip = ['facebook.com','fb.com','instagram.com','fb.watch',
-                          'metastatus.com','fbcdn.net','fbsbx.com','fburl.com'];
+            const skipDomains = ['metastatus.com','fbcdn.net','fbsbx.com',
+                                 'facebook.com','instagram.com','fb.watch','fb.com'];
 
-            // All anchor tags with href (no filter on target)
+            function unwrap(href) {
+                // Facebook redirect: l.facebook.com/l.php?u=ENCODED or
+                // www.facebook.com/flx/warn/?u=ENCODED
+                try {
+                    const u = new URL(href);
+                    const real = u.searchParams.get('u') || u.searchParams.get('target');
+                    if (real) return decodeURIComponent(real);
+                } catch(e) {}
+                return href;
+            }
+
             for (const a of document.querySelectorAll('a[href]')) {
-                const href = a.href || '';
-                if (!href.startsWith('http')) continue;
+                const raw = a.href || '';
+                if (!raw.startsWith('http')) continue;
+
+                const href = unwrap(raw);
+
                 try {
                     const u = new URL(href);
                     const d = u.hostname.replace(/^www\\./, '');
                     if (!d || !d.includes('.')) continue;
                     if (seen.has(d)) continue;
-                    if (skip.some(s => d.endsWith(s) || d.includes(s))) continue;
+                    if (skipDomains.some(s => d === s || d.endsWith('.' + s))) continue;
                     seen.add(d);
 
-                    // Walk up to find ad card (max 20 levels)
+                    // Walk up to find ad card
                     let card = a;
                     for (let i = 0; i < 20; i++) {
                         if (!card.parentElement) break;
@@ -396,7 +414,7 @@ async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms     = inp.get("searchTerms",     ["skincare", "supplements", "coffee", "fitness", "sneakers"])
+        search_terms     = inp.get("searchTerms",     ["belts"])
         filter_kws       = inp.get("filterKeywords",  [])
         target_verts     = inp.get("targetVerticals", [])
         country          = inp.get("country",         "ALL")
