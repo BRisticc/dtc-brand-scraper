@@ -29,6 +29,7 @@ from apify import Actor
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from classifier import classify, confidence_label
+from phrases import get_phrases, ALL_VERTICALS
 
 # Stealth JS injected before every page load
 # Patches the signals Facebook uses to detect headless Chromium
@@ -414,13 +415,20 @@ async def main() -> None:
     async with Actor:
         inp = await Actor.get_input() or {}
 
-        search_terms     = inp.get("searchTerms",        ["belts"])
+        smart_mode       = inp.get("smartMode",          False)
+        sweep_verticals  = inp.get("sweepVerticals",     [])
+        search_terms     = inp.get("searchTerms",        ["genuine leather belt", "shop now free shipping"])
         filter_kws       = inp.get("filterKeywords",     [])
         target_verts     = inp.get("targetVerticals",    [])
         country          = inp.get("country",            "ALL")
         is_targeted      = inp.get("isTargetedCountry",  False)
         ads_limit        = inp.get("adsLimitPerTerm",    200)
         max_brands       = inp.get("maxBrands",          500)
+
+        if smart_mode:
+            verts = [v.lower() for v in sweep_verticals] if sweep_verticals else None
+            search_terms = get_phrases(verts)
+            log.info(f"Smart mode | verticals={verts or 'ALL'} | phrases={len(search_terms)}")
 
         log.info(f"Starting | terms={len(search_terms)} | country={country} | limit={ads_limit}")
 

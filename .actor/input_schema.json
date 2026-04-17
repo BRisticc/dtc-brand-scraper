@@ -3,30 +3,41 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "searchTerms": {
-      "title": "Search Terms",
+    "smartMode": {
+      "title": "Smart Mode",
+      "type": "boolean",
+      "description": "Automatically sweeps Meta Ad Library using a built-in library of 100+ DTC-specific phrases across all verticals (beauty, supplements, fashion, accessories/belts, food, fitness, pet, home, tech, baby). Ignores Search Terms when enabled.",
+      "default": false
+    },
+    "sweepVerticals": {
+      "title": "Sweep Verticals (Smart Mode only)",
       "type": "array",
-      "description": "Keywords used to search Meta Ad Library. Each term triggers a separate search run.",
+      "description": "Which verticals to sweep in Smart Mode. Leave empty to sweep ALL. Options: beauty, supplements, fashion, accessories, food_beverage, fitness, pet, home, tech_gadgets, baby_kids",
+      "editor": "stringList",
+      "default": []
+    },
+    "searchTerms": {
+      "title": "Search Terms (Manual Mode)",
+      "type": "array",
+      "description": "Custom keywords to search. Used only when Smart Mode is OFF. Each term triggers a separate search run.",
       "editor": "stringList",
       "default": [
+        "genuine leather belt",
         "shop now free shipping",
-        "buy now limited offer",
-        "try risk free",
-        "subscribe and save",
-        "as seen on tiktok"
+        "try risk free"
       ]
     },
     "filterKeywords": {
-      "title": "Filter Keywords (Research Targets)",
+      "title": "Filter Keywords",
       "type": "array",
       "description": "Only keep brands whose domain or ad text contains at least one of these keywords. Leave empty to keep all brands.",
       "editor": "stringList",
       "default": []
     },
     "targetVerticals": {
-      "title": "Target Verticals",
+      "title": "Target Verticals (Output Filter)",
       "type": "array",
-      "description": "Only output brands classified in these verticals. Leave empty for all verticals.",
+      "description": "Only output brands classified in these verticals. Leave empty for all verticals. Options: beauty, supplements, fashion, accessories, food_beverage, fitness, pet, home, tech_gadgets, baby_kids",
       "editor": "stringList",
       "default": [],
       "example": ["beauty", "supplements", "fitness"]
@@ -49,8 +60,8 @@
     "adsLimitPerTerm": {
       "title": "Ads Limit Per Term",
       "type": "integer",
-      "description": "How many ads to scroll through per search term",
-      "default": 200,
+      "description": "How many ads to scroll through per search term. In Smart Mode with many terms, keep this low (20-50) to avoid very long runs.",
+      "default": 50,
       "minimum": 20,
       "maximum": 2000
     },
