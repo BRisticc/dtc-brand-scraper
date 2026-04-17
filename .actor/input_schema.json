@@ -36,7 +36,7 @@
       "type": "string",
       "description": "2-letter country code for Ad Library",
       "editor": "textfield",
-      "default": "US"
+      "default": "ALL"
     },
     "adsLimitPerTerm": {
       "title": "Ads Limit Per Term",

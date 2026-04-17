@@ -90,14 +90,20 @@ SCROLL_WAIT_MS  = 2500
 # ─────────────────────────────────────────
 
 def build_url(term: str, country: str) -> str:
-    return f"{AD_LIBRARY_BASE}?" + urlencode({
-        "active_status": "all",
-        "ad_type":       "all",
-        "country":       country,
-        "q":             term,
-        "search_type":   "keyword_unordered",
-        "media_type":    "all",
-    })
+    # active + sorted by impressions = biggest active spenders first
+    from urllib.parse import quote
+    return (
+        f"{AD_LIBRARY_BASE}"
+        f"?active_status=active"
+        f"&ad_type=all"
+        f"&country={country}"
+        f"&is_targeted_country=false"
+        f"&media_type=all"
+        f"&q={quote(term)}"
+        f"&search_type=keyword_unordered"
+        f"&sort_data[direction]=desc"
+        f"&sort_data[mode]=total_impressions"
+    )
 
 
 def extract_domain(url: str) -> str | None:
@@ -393,7 +399,7 @@ async def main() -> None:
         search_terms     = inp.get("searchTerms",     ["skincare", "supplements", "coffee", "fitness", "sneakers"])
         filter_kws       = inp.get("filterKeywords",  [])
         target_verts     = inp.get("targetVerticals", [])
-        country          = inp.get("country",         "US")
+        country          = inp.get("country",         "ALL")
         ads_limit        = inp.get("adsLimitPerTerm", 200)
         max_brands       = inp.get("maxBrands",       500)
 
